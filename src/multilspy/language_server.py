@@ -1841,6 +1841,8 @@ class SyncLanguageServer:
 
         :return: A list of root symbols representing the top-level packages/modules in the project.
         """
+        if self.loop is None:
+            raise RuntimeError("Language server event loop is not running (self.loop is None). Please ensure the language server is started before making symbol requests.")
         result = asyncio.run_coroutine_threadsafe(
             self.language_server.request_full_symbol_tree(within_relative_path, include_body), self.loop
         ).result(timeout=self.timeout)

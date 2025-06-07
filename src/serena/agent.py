@@ -15,7 +15,7 @@ from copy import copy
 from dataclasses import dataclass, field
 from logging import Logger
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Self, TypeVar, Union, Optional
 
 import yaml
 from sensai.util import logging
@@ -33,8 +33,14 @@ from serena.symbol import SymbolLocation, SymbolManager
 from serena.text_utils import search_files
 from serena.util.file_system import scan_directory
 from serena.util.inspection import iter_subclasses
-from serena.util.shell import execute_shell_command
-
+from serena.util.terminal_tools import (
+    TerminalExecutorLogic,
+    TerminalReaderLogic,
+    TerminalTerminatorLogic,
+    TerminalSessionListerLogic,
+    ProcessListerLogic,
+    ProcessKillerLogic,
+)
 if TYPE_CHECKING:
     from serena.gui_log_viewer import GuiLogViewerHandler
 
@@ -1471,41 +1477,65 @@ class SearchForPatternTool(Tool):
         return self._limit_length(result, max_answer_chars)
 
 
-class ExecuteShellCommandTool(Tool, ToolMarkerCanEdit):
-    """
-    Executes a shell command.
-    """
+# Terminal Tools - Wrappers for tools from serena.util.terminal_tools
+# These wrappers ensure the tools are discoverable by _iter_tool_classes
 
+class ExecuteCommandTool(Tool, ToolMarkerCanEdit):
+    __module__ = Tool.__module__
+    """Execute a terminal command with configurable timeout and shell selection."""
     def apply(
         self,
         command: str,
-        cwd: str | None = None,
-        capture_stderr: bool = True,
-        max_answer_chars: int = _DEFAULT_MAX_ANSWER_LENGTH,
+        timeout_ms: int = 5000,
+        shell: Optional[str] = None
     ) -> str:
-        """
-        Execute a shell command and return its output.
+        # Get the project root directory if a project is active
+        cwd = None
+        if self.agent.project_config is not None:
+            cwd = self.agent.project_config.project_root
+        
+        # Instantiates and uses the logic class from terminal_tools.py
+        executor = TerminalExecutorLogic()
+        return executor.execute(command=command, timeout_ms=timeout_ms, shell=shell, cwd=cwd)
 
-        IMPORTANT: you should always consider the memory about suggested shell commands before using this tool.
-        If this memory was not loaded in the current conversation, you should load it using the `read_memory` tool
-        before using this tool.
+class ReadOutputTool(Tool):
+    __module__ = Tool.__module__
+    """Read new output from a running terminal session."""
+    def apply(
+        self,
+        pid: int,
+        timeout_ms: int = 5000
+    ) -> str:
+        reader = TerminalReaderLogic()
+        return reader.read(pid=pid, timeout_ms=timeout_ms)
 
-        You should have at least once looked at the suggested shell commands from the corresponding memory
-        created during the onboarding process before using this tool.
-        Never execute unsafe shell commands like `rm -rf /` or similar! Generally be very careful with deletions.
+class ForceTerminateTool(Tool):
+    __module__ = Tool.__module__
+    """Force terminate a running terminal session."""
+    def apply(self, pid: int) -> str:
+        terminator = TerminalTerminatorLogic()
+        return terminator.terminate(pid=pid)
 
-        :param command: the shell command to execute
-        :param cwd: the working directory to execute the command in. If None, the project root will be used.
-        :param capture_stderr: whether to capture and return stderr output
-        :param max_answer_chars: if the output is longer than this number of characters,
-            no content will be returned. Don't adjust unless there is really no other way to get the content
-            required for the task.
-        :return: a JSON object containing the command's stdout and optionally stderr output
-        """
-        _cwd = cwd or self.project_root
-        result = execute_shell_command(command, cwd=_cwd, capture_stderr=capture_stderr)
-        result = result.json()
-        return self._limit_length(result, max_answer_chars)
+class ListSessionsTool(Tool):
+    __module__ = Tool.__module__
+    """List all active terminal sessions."""
+    def apply(self) -> str:
+        lister = TerminalSessionListerLogic()
+        return lister.list_sessions()
+
+class ListProcessesTool(Tool):
+    __module__ = Tool.__module__
+    """List all running processes on the system."""
+    def apply(self) -> str:
+        lister = ProcessListerLogic()
+        return lister.list_processes()
+
+class KillProcessTool(Tool, ToolMarkerCanEdit):
+    __module__ = Tool.__module__
+    """Terminate a running process by PID."""
+    def apply(self, pid: int) -> str:
+        killer = ProcessKillerLogic()
+        return killer.kill(pid=pid)
 
 
 class GetActiveProjectTool(Tool, ToolMarkerDoesNotRequireActiveProject):
