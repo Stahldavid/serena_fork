@@ -1,25 +1,35 @@
 import json
 import os
 import time
+from dataclasses import dataclass
 
 import pytest
 
 from multilspy.multilspy_config import Language
-from serena.agent import FindReferencingSymbolsTool, FindSymbolTool, ProjectConfig, SerenaAgent, SerenaConfig
+from serena.agent import FindReferencingSymbolsTool, FindSymbolTool, SerenaAgent, SerenaConfigBase
 from test.conftest import LanguageParamRequest, get_repo_path
+
+
+@dataclass
+class SerenaConfigForTests(SerenaConfigBase):
+    """
+    In-memory implementation of Serena configuration with the GUI disabled.
+    """
+
+    gui_log_window_enabled: bool = False
+    web_dashboard: bool = False
 
 
 @pytest.fixture
 def serena_config():
-    return SerenaConfig()
+    return SerenaConfigForTests()
 
 
 @pytest.fixture
 def serena_agent(request: LanguageParamRequest, serena_config) -> SerenaAgent:
     language = Language(request.param)
     repo = get_repo_path(language)
-    project_config = ProjectConfig(project_name=os.path.basename(str(repo)), language=language, project_root=str(repo))
-    return SerenaAgent(project_config=project_config, serena_config=serena_config)
+    return SerenaAgent(project=str(repo), serena_config=serena_config)
 
 
 class TestSerenaAgent:
@@ -41,9 +51,9 @@ class TestSerenaAgent:
         result = find_symbol_tool.apply(symbol_name)
         symbols = json.loads(result)
         assert any(
-            symbol_name in s["name"] and expected_kind.lower() in s["kind"].lower() and expected_file in s["location"]["relative_path"]
+            symbol_name in s["name_path"] and expected_kind.lower() in s["kind"].lower() and expected_file in s["relative_path"]
             for s in symbols
-        ), f"Expected to find {symbol_name} ({expected_kind}) in {expected_file} for {agent.project_config.language.name}"
+        ), f"Expected to find {symbol_name} ({expected_kind}) in {expected_file} for {agent.get_active_project().language.name}"
 
     @pytest.mark.parametrize(
         "serena_agent,symbol_name,def_file,ref_file",
@@ -73,20 +83,18 @@ class TestSerenaAgent:
         agent = serena_agent
         # Find the symbol location first
         find_symbol_tool = agent.get_tool(FindSymbolTool)
-        result = find_symbol_tool.apply(symbol_name, within_relative_path=def_file)
+        result = find_symbol_tool.apply(symbol_name, relative_path=def_file)
         time.sleep(1)
         symbols = json.loads(result)
-        # Find the definition location
+        # Find the definition
         def_symbol = symbols[0]
-        loc = def_symbol["location"]
-        # sel_start = def_symbol["location"]["selectionRange"]["start"]
         # Now find references
         find_refs_tool = agent.get_tool(FindReferencingSymbolsTool)
-        result = find_refs_tool.apply(def_file, loc["line"], loc["column"])
+        result = find_refs_tool.apply(name_path=def_symbol["name_path"], relative_path=def_symbol["relative_path"])
         refs = json.loads(result)
         assert any(
-            ref["location"]["relative_path"] == ref_file for ref in refs
-        ), f"Expected to find reference to {symbol_name} in {ref_file} for {agent.project_config.language.name}. refs={refs}"
+            ref["relative_path"] == ref_file for ref in refs
+        ), f"Expected to find reference to {symbol_name} in {ref_file} for {agent._active_project.language.name}. refs={refs}"
 
     @pytest.mark.parametrize(
         "serena_agent,name_path,substring_matching,expected_symbol_name,expected_kind,expected_file",
@@ -168,7 +176,7 @@ class TestSerenaAgent:
         result = find_symbol_tool.apply(
             name_path=name_path,
             depth=0,
-            within_relative_path=None,
+            relative_path=None,
             include_body=False,
             include_kinds=None,
             exclude_kinds=None,
@@ -176,11 +184,11 @@ class TestSerenaAgent:
         )
         symbols = json.loads(result)
         assert any(
-            expected_symbol_name == s["name"]
+            expected_symbol_name == s["name_path"].split("/")[-1]
             and expected_kind.lower() in s["kind"].lower()
-            and expected_file in s["location"]["relative_path"]
+            and expected_file in s["relative_path"]
             for s in symbols
-        ), f"Expected to find {name_path} ({expected_kind}) in {expected_file} for {agent.project_config.language.name}. Symbols: {symbols}"
+        ), f"Expected to find {name_path} ({expected_kind}) in {expected_file} for {agent._active_project.language.name}. Symbols: {symbols}"
 
     @pytest.mark.parametrize(
         "serena_agent,name_path",
@@ -215,4 +223,4 @@ class TestSerenaAgent:
         symbols = json.loads(result)
         assert (
             not symbols
-        ), f"Expected to find no symbols for {name_path} for {agent.project_config.language.name}. Symbols found: {symbols}"
+        ), f"Expected to find no symbols for {name_path} for {agent._active_project.language.name}. Symbols found: {symbols}"

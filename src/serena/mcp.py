@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from logging import Formatter, Logger, StreamHandler
+from pathlib import Path
 from typing import Any, Literal
 
 import click  # Add click import
@@ -101,15 +102,27 @@ def create_mcp_server_and_agent(
     port: int = 8000,
     context: str = DEFAULT_CONTEXT,
     modes: Sequence[str] = DEFAULT_MODES,
+    enable_web_dashboard: bool | None = None,
+    enable_gui_log_window: bool | None = None,
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] | None = None,
+    trace_lsp_communication: bool | None = None,
 ) -> tuple[FastMCP, SerenaAgent]:
     """
     Create an MCP server.
 
-    :param project: The path to the project directory or the `project.yml` file therein, or None.
+    :param project: "Either an absolute path to the project directory or a name of an already registered project. "
+        "If the project passed here hasn't been registered yet, it will be registered automatically and can be activated by its name "
+        "afterwards.
     :param host: The host to bind to
     :param port: The port to bind to
     :param context: The context name or path to context file
     :param modes: List of mode names or paths to mode files
+    :param enable_web_dashboard: Whether to enable the web dashboard. If not specified, will take the value from the serena configuration.
+    :param enable_gui_log_window: Whether to enable the GUI log window. It currently does not work on macOS, and setting this to True will be ignored then.
+        If not specified, will take the value from the serena configuration.
+    :param log_level: Log level. If not specified, will take the value from the serena configuration.
+    :param trace_lsp_communication: Whether to trace the communication between Serena and the language servers.
+        This is useful for debugging language server issues.
     """
     mcp: FastMCP | None = None
     context_instance = SerenaAgentContext.load(context)
@@ -117,11 +130,15 @@ def create_mcp_server_and_agent(
 
     try:
         agent = SerenaAgent(
-            project_config=project,
+            project=project,
             # Callback disabled for the time being (see above)
             # project_activation_callback=update_tools
             context=context_instance,
             modes=modes_instances,
+            enable_web_dashboard=enable_web_dashboard,
+            enable_gui_log_window=enable_gui_log_window,
+            log_level=log_level,
+            trace_lsp_communication=trace_lsp_communication,
         )
     except Exception as e:
         show_fatal_exception_safe(e)
@@ -134,7 +151,7 @@ def create_mcp_server_and_agent(
         # unfortunately, query for changed tools. It only queries for changed resources and prompts regularly,
         # so we need to register all tools at startup, unfortunately.
         nonlocal mcp, agent
-        tools = agent.get_exposed_tools()
+        tools = agent.get_exposed_tool_instances()
         if mcp is not None:
             mcp._tool_manager._tools = {}
             for tool in tools:
@@ -144,8 +161,11 @@ def create_mcp_server_and_agent(
     @asynccontextmanager
     async def server_lifespan(mcp_server: FastMCP) -> AsyncIterator[None]:
         """Manage server startup and shutdown lifecycle."""
+        nonlocal agent
         mark_used(mcp_server)
         yield
+        if agent.language_server is not None:
+            agent.language_server.stop()
 
     mcp_settings = Settings(lifespan=server_lifespan, host=host, port=port)
     mcp = FastMCP(**mcp_settings.model_dump())
@@ -155,33 +175,43 @@ def create_mcp_server_and_agent(
     return mcp, agent
 
 
+class ProjectType(click.ParamType):
+    name = "[PROJECT_NAME|PROJECT_PATH]"
+
+    def convert(self, value: str, param: click.Parameter | None, ctx: click.Context | None) -> str:
+        path = Path(value).resolve()
+        if path.exists() and path.is_dir():
+            return str(path)  # Valid path
+        return value  # Assume it's a project name
+
+
+PROJECT_TYPE = ProjectType()
+
+
 @click.command()
-# Add --project option as the primary, more intuitive interface
 @click.option(
     "--project",
-    "project_file_opt",  # Use same destination variable to avoid conflicts
-    type=click.Path(exists=True, dir_okay=True, resolve_path=True),
+    "project_file_opt",
+    type=PROJECT_TYPE,
     default=None,
-    help="Path to the .yml project file. "
-    "Does not need to be provided at startup since you can activate a project later by simply asking the agent to do so "
-    "(there is a dedicated tool for this purpose).",
+    help="Either an absolute path to the project directory or a name of an already registered project. "
+    "If the project passed here hasn't been registered yet, it will be registered automatically and can be activated by its name afterwards.",
 )
 # Keep --project-file for backwards compatibility
 @click.option(
     "--project-file",
     "project_file_opt",  # Use same destination variable to avoid conflicts
-    type=click.Path(exists=True, dir_okay=True, resolve_path=True),
+    type=PROJECT_TYPE,
     default=None,
-    help="[DEPRECATED] Use --project instead. Optional path to the .yml project file via option."
-    "Does not need to be provided at startup since you can activate a project later by simply asking the agent to do so "
-    "(there is a dedicated tool for this purpose).",
+    help="[DEPRECATED] Use --project instead.",
 )
 # Positional argument for backwards compatibility
 @click.argument(
     "project_file_arg",
-    type=click.Path(exists=True, dir_okay=True, resolve_path=True),
+    type=PROJECT_TYPE,
     required=False,
     default=None,
+    metavar="",  # don't display anything since it's deprecated
 )
 @click.option(
     "--context",
@@ -206,7 +236,7 @@ def create_mcp_server_and_agent(
     type=click.Choice(["stdio", "sse"]),
     default="stdio",
     show_default=True,
-    help="Transport protocol.",
+    help="Transport protocol. If you start the server yourself (as opposed to an MCP Client starting the server), sse is recommended.",
 )
 @click.option(
     "--host",
@@ -222,6 +252,34 @@ def create_mcp_server_and_agent(
     default=8000,
     help="Port to bind to (for SSE transport).",
 )
+@click.option(
+    "--enable-web-dashboard",
+    type=bool,
+    is_flag=False,
+    default=None,
+    help="Whether to enable the web dashboard. If not specified, will take the value from the serena configuration.",
+)
+@click.option(
+    "--enable-gui-log-window",
+    type=bool,
+    is_flag=False,
+    default=None,
+    help="Whether to enable the GUI log window. It currently does not work on macOS, and setting this to True will be ignored then. "
+    "If not specified, will take the value from the serena configuration.",
+)
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]),
+    default=None,
+    help="Log level for GUI, dashboard and other logging. If not specified, will take the value from the serena configuration.",
+)
+@click.option(
+    "--trace-lsp-communication",
+    type=bool,
+    is_flag=False,
+    default=None,
+    help="Whether to trace the communication between Serena and the language servers. This is useful for debugging language server issues.",
+)
 def start_mcp_server(
     project_file_opt: str | None,
     project_file_arg: str | None,
@@ -230,18 +288,32 @@ def start_mcp_server(
     transport: Literal["stdio", "sse"] = "stdio",
     host: str = "0.0.0.0",
     port: int = 8000,
+    enable_web_dashboard: bool | None = None,
+    enable_gui_log_window: bool | None = None,
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] | None = None,
+    trace_lsp_communication: bool | None = None,
 ) -> None:
-    """Starts the Serena MCP server.
-
-    Accepts a path to the project directory or the `project.yml` file therein via the --project option.
+    """Starts the Serena MCP server. By default, will not activate any project at startup.
+    If you want to start with an already active project, use --project to pass the project name or path.
 
     Use --context to specify the execution environment and --mode to specify behavior mode(s).
+    The modes may be adjusted after startup (via the corresponding tool), but the context cannot be changed.
     """
     # Prioritize the positional argument if provided
     # This is for backward compatibility with the old CLI, should be removed in the future!
     project_file = project_file_arg if project_file_arg is not None else project_file_opt
 
-    mcp_server, agent = create_mcp_server_and_agent(project=project_file, host=host, port=port, context=context, modes=modes)
+    mcp_server, agent = create_mcp_server_and_agent(
+        project=project_file,
+        host=host,
+        port=port,
+        context=context,
+        modes=modes,
+        enable_web_dashboard=enable_web_dashboard,
+        enable_gui_log_window=enable_gui_log_window,
+        log_level=log_level,
+        trace_lsp_communication=trace_lsp_communication,
+    )
 
     # log after server creation such that the log appears in the GUI
     if project_file_arg is not None:
@@ -251,6 +323,9 @@ def start_mcp_server(
             f"Used path: {project_file}"
         )
 
-    log.info(f"Starting serena agent in MCP server with config:\n{agent.get_current_config_overview()}")
+    log.info(
+        f"Starting serena agent in MCP server with config:\n{agent.get_current_config_overview()}."
+        f"\n Log level: {agent.serena_config.log_level}"
+    )
 
     mcp_server.run(transport=transport)

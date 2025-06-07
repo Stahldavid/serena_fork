@@ -19,11 +19,10 @@ from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from copy import copy
 from pathlib import Path, PurePath
-from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union, cast
+from typing import AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple, Union, cast
 
 import pathspec
 
-from serena.text_utils import LineType, MatchedConsecutiveLines, TextLine, search_files
 from . import multilspy_types
 from .lsp_protocol_handler import lsp_types as LSPTypes
 from .lsp_protocol_handler.lsp_constants import LSPConstants
@@ -32,6 +31,7 @@ from .lsp_protocol_handler.server import (
     Error,
     LanguageServerHandler,
     ProcessLaunchInfo,
+    StringDict,
 )
 from .multilspy_config import Language, MultilspyConfig
 from .multilspy_exceptions import MultilspyException
@@ -47,10 +47,19 @@ from .lsp_protocol_handler import lsp_types
 # since it caches (in-memory) file contents, so we can avoid reading from disk.
 # Moreover, the way we want to use the language server (for retrieving actual content),
 # it makes sense to have more content-related utils directly in it.
+from serena.text_utils import LineType, MatchedConsecutiveLines, TextLine, search_files
+
 
 
 GenericDocumentSymbol = Union[LSPTypes.DocumentSymbol, LSPTypes.SymbolInformation, multilspy_types.UnifiedSymbolInformation]
 
+@dataclasses.dataclass(kw_only=True)
+class ReferenceInSymbol:
+    """A symbol retrieved when requesting reference to a symbol, together with the location of the reference"""
+    symbol: multilspy_types.UnifiedSymbolInformation
+    line: int
+    character: int
+    
 @dataclasses.dataclass
 class LSPFileBuffer:
     """
@@ -136,11 +145,11 @@ class LanguageServer:
             return PyrightServer(config, logger, repository_root_path)
             # It used to be jedi, but pyright is a bit faster, and also more actively maintained
             # Keeping the previous code for reference
-            from multilspy.language_servers.jedi_language_server.jedi_server import (
-                JediServer,
-            )
+            # from multilspy.language_servers.jedi_language_server.jedi_server import (
+            #     JediServer,
+            # )
 
-            return JediServer(config, logger, repository_root_path)
+            # return JediServer(config, logger, repository_root_path)
         elif config.code_language == Language.JAVA:
             from multilspy.language_servers.eclipse_jdtls.eclipse_jdtls import (
                 EclipseJDTLS,
@@ -224,18 +233,15 @@ class LanguageServer:
         self.completions_available = asyncio.Event()
 
         if config.trace_lsp_communication:
-
-            def logging_fn(source, target, msg):
+            def logging_fn(source: str, target: str, msg: StringDict | str):
                 self.logger.log(f"LSP: {source} -> {target}: {str(msg)}", logging.DEBUG)
-
         else:
-
-            def logging_fn(source, target, msg):
-                pass
+            logging_fn = None
+            
 
         # cmd is obtained from the child classes, which provide the language specific command to start the language server
         # LanguageServerHandler provides the functionality to start the language server and communicate with it
-        self.server: LanguageServerHandler = LanguageServerHandler(
+        self.server = LanguageServerHandler(
             process_launch_info,
             logger=logging_fn,
             start_independent_lsp_process=config.start_independent_lsp_process,
@@ -248,7 +254,7 @@ class LanguageServer:
         self._document_symbols_cache:  dict[str, Tuple[str, Tuple[List[multilspy_types.UnifiedSymbolInformation], List[multilspy_types.UnifiedSymbolInformation]]]] = {}
         """Maps file paths to a tuple of (file_content_hash, result_of_request_document_symbols)"""
         self.load_cache()
-        self._cache_has_changed = bool
+        self._cache_has_changed: bool = False
         self.language = Language(language_id)
 
         # Set up the pathspec matcher for the ignored paths
@@ -433,10 +439,9 @@ class LanguageServer:
 
         file_buffer = self.open_file_buffers[uri]
         file_buffer.version += 1
-        change_index = TextUtils.get_index_from_line_col(file_buffer.contents, line, column)
-        file_buffer.contents = (
-            file_buffer.contents[:change_index] + text_to_be_inserted + file_buffer.contents[change_index:]
-        )
+
+        new_contents, new_l, new_c = TextUtils.insert_text_at_position(file_buffer.contents, line, column, text_to_be_inserted)
+        file_buffer.contents = new_contents
         self.server.notify.did_change_text_document(
             {
                 LSPConstants.TEXT_DOCUMENT: {
@@ -454,7 +459,6 @@ class LanguageServer:
                 ],
             }
         )
-        new_l, new_c = TextUtils.get_updated_position_from_line_and_column_and_edit(line, column, text_to_be_inserted)
         return multilspy_types.Position(line=new_l, character=new_c)
 
     def delete_text_between_positions(
@@ -481,10 +485,8 @@ class LanguageServer:
 
         file_buffer = self.open_file_buffers[uri]
         file_buffer.version += 1
-        del_start_idx = TextUtils.get_index_from_line_col(file_buffer.contents, start["line"], start["character"])
-        del_end_idx = TextUtils.get_index_from_line_col(file_buffer.contents, end["line"], end["character"])
-        deleted_text = file_buffer.contents[del_start_idx:del_end_idx]
-        file_buffer.contents = file_buffer.contents[:del_start_idx] + file_buffer.contents[del_end_idx:]
+        new_contents, deleted_text = TextUtils.delete_text_between_positions(file_buffer.contents, start_line=start["line"], start_col=start["character"], end_line=end["line"], end_col=end["character"])
+        file_buffer.contents = new_contents
         self.server.notify.did_change_text_document(
             {
                 LSPConstants.TEXT_DOCUMENT: {
@@ -687,22 +689,7 @@ class LanguageServer:
         """
         with self.open_file(relative_file_path) as file_data:
             file_contents = file_data.contents
-
-        line_contents = file_contents.split("\n")
-        start_lineno = max(0, line - context_lines_before)
-        end_lineno = min(len(line_contents) - 1, line + context_lines_after)
-        # instantiate TextLines with the write LineType
-        text_lines: list[TextLine] = []
-        # before the line
-        for lineno in range(start_lineno, line):
-            text_lines.append(TextLine(line_number=lineno, line_content=line_contents[lineno], match_type=LineType.BEFORE_MATCH))
-        # the line
-        text_lines.append(TextLine(line_number=line, line_content=line_contents[line], match_type=LineType.MATCH))
-        # after the line
-        for lineno in range(line + 1, end_lineno + 1):
-            text_lines.append(TextLine(line_number=lineno, line_content=line_contents[lineno], match_type=LineType.AFTER_MATCH))
-
-        return MatchedConsecutiveLines(lines=text_lines, source_file_path=relative_file_path)
+        return MatchedConsecutiveLines.from_file_contents(file_contents, line=line, context_lines_before=context_lines_before, context_lines_after=context_lines_after, source_file_path=relative_file_path)
 
 
     async def request_completions(
@@ -813,7 +800,6 @@ class LanguageServer:
             where the parent attribute will be the file symbol which in turn may have a package symbol as parent.
             If you need a symbol tree that contains file symbols as well, you should use `request_full_symbol_tree` instead.
         """
-        self.logger.log(f"Requesting document symbols for {relative_file_path} for the first time", logging.DEBUG)
         # TODO: it's kinda dumb to not use the cache if include_body is False after include_body was True once
         #   Should be fixed in the future, it's a small performance optimization
         cache_key = f"{relative_file_path}-{include_body}"
@@ -825,9 +811,11 @@ class LanguageServer:
                     self.logger.log(f"Returning cached document symbols for {relative_file_path}", logging.DEBUG)
                     return result
                 else:
-                    self.logger.log(f"Content for {relative_file_path} has changed. Overwriting cache", logging.INFO)
+                    self.logger.log(f"Content for {relative_file_path} has changed. Will overwrite in-memory cache", logging.DEBUG)
+            else:
+                self.logger.log(f"No cache hit for symbols with {include_body=} in {relative_file_path}", logging.DEBUG)
 
-
+            self.logger.log(f"Requesting document symbols for {relative_file_path} from the Language Server", logging.DEBUG)
             response = await self.server.send.document_symbol(
                 {
                     "textDocument": {
@@ -835,6 +823,7 @@ class LanguageServer:
                     }
                 }
             )
+            self.logger.log(f"Received {len(response) if response is not None else None} document symbols for {relative_file_path} from the Language Server", logging.DEBUG)
 
         def turn_item_into_symbol_with_children(item: GenericDocumentSymbol):
             item = cast(multilspy_types.UnifiedSymbolInformation, item)
@@ -1177,42 +1166,25 @@ class LanguageServer:
 
 
     async def request_parsed_files(self) -> list[str]:
-        """
-        Retrieves relative paths of all files analyzed by the Language Server.
-
-        This is slow, as it finds all files by finding all symbols.
-
-        This seems to be the only way, the LSP does not provide any endpoints for listing project files."""
+        """Retrieves relative paths of all files analyzed by the Language Server."""
         if not self.server_started:
             self.logger.log(
                 "request_parsed_files called before Language Server started",
                 logging.ERROR,
             )
             raise MultilspyException("Language Server not started")
-        # TODO: this worked in jedi, but pyright and basedpyright return nothing...
-        # I don't know why
-        # params = LSPTypes.WorkspaceSymbolParams(query="")  # Empty query returns all symbols
-        # symbols = await self.server.send.workspace_symbol(params) or []
-
-        # Thus, instead of calling all symbols, we hack this and use the symbol tree instead, which
-        # seems to work in all these language servers
-        # walk through all children recursively, find all symbols of type Module and collect their relative paths
-        roots = await self.request_full_symbol_tree()
-        paths = []
-        def collect_module_files(symbol):
-            if symbol["kind"] == multilspy_types.SymbolKind.File:
-                assert "location" in symbol
-                paths.append(symbol["location"]["relativePath"])
-
-            elif symbol["kind"] == multilspy_types.SymbolKind.Package:
-                for child in symbol["children"]:
-                    collect_module_files(child)
-
-        for root in roots:
-            collect_module_files(root)
-
-        return paths
-
+        rel_file_paths = []
+        for root, dirs, files in os.walk(self.repository_root_path):
+            # Don't go into directories that are ignored by modifying dirs inplace
+            # Explanation for the  + "/" part:
+            # pathspec can't handle the matching of directories if they don't end with a slash!
+            # see https://github.com/cpburnz/python-pathspec/issues/89
+            dirs[:] = [d for d in dirs if not self.is_ignored_path(os.path.join(root, d) + "/")]
+            for file in files:
+                rel_file_path = os.path.join(root, file)
+                if not self.is_ignored_path(rel_file_path):
+                    rel_file_paths.append(rel_file_path)
+        return rel_file_paths
 
     async def search_files_for_pattern(
         self,
@@ -1255,7 +1227,7 @@ class LanguageServer:
         include_self: bool = False,
         include_body: bool = False,
         include_file_symbols: bool = False,
-    ) -> List[multilspy_types.UnifiedSymbolInformation]:
+    ) -> List[ReferenceInSymbol]:
         """
         Finds all symbols that reference the symbol at the given location.
         This is similar to request_references but filters to only include symbols
@@ -1272,7 +1244,7 @@ class LanguageServer:
         :param include_body: whether to include the body of the symbols in the result.
         :param include_file_symbols: whether to include references that are file symbols. This
             is often a fallback mechanism for when the reference cannot be resolved to a symbol.
-        :return: List of symbols that reference the target symbol.
+        :return: List of objects containing the symbol and the location of the reference.
         """
         if not self.server_started:
             self.logger.log(
@@ -1367,7 +1339,7 @@ class LanguageServer:
                 ):
                     incoming_symbol = containing_symbol
                     if include_self:
-                        result.append(containing_symbol)
+                        result.append(ReferenceInSymbol(symbol=containing_symbol, line=ref_line, character=ref_col))
                         continue
                     else:
                         self.logger.log(f"Found self-reference for {incoming_symbol['name']}, skipping it since {include_self=}", logging.DEBUG)
@@ -1389,7 +1361,7 @@ class LanguageServer:
                     )
                     continue
 
-                result.append(containing_symbol)
+                result.append(ReferenceInSymbol(symbol=containing_symbol, line=ref_line, character=ref_col))
 
         return result
 
@@ -1593,6 +1565,9 @@ class LanguageServer:
                         f"Failed to save document symbols cache to {self._cache_path}: {e}. "
                         "Note: this may have resulted in a corrupted cache file.", logging.ERROR
                     )
+        else:
+            self.logger.log(f"No changes to document symbols cache, skipping save", logging.DEBUG)
+        self._cache_has_changed = False
 
     def load_cache(self):
         if not self._cache_path.exists():
@@ -1677,6 +1652,10 @@ class SyncLanguageServer:
         """
         return SyncLanguageServer(LanguageServer.create(config, logger, repository_root_path, add_gitignore_content_to_config=add_gitignore_content_to_config), timeout=timeout)
 
+    @property
+    def repository_root_path(self) -> str:
+        return self.language_server.repository_root_path
+    
     @contextmanager
     def open_file(self, relative_file_path: str) -> Iterator[LSPFileBuffer]:
         """
@@ -1928,9 +1907,7 @@ class SyncLanguageServer:
         return self.language_server.retrieve_symbol_body(symbol)
 
     def request_parsed_files(self) -> list[str]:
-        """This is slow, as it finds all files by finding all symbols.
-
-        This seems to be the only way, the LSP does not provide any endpoints for listing project files."""
+        """Retrieves relative paths of all files analyzed by the Language Server."""
         assert self.loop
         result = asyncio.run_coroutine_threadsafe(
             self.language_server.request_parsed_files(), self.loop
@@ -1942,7 +1919,7 @@ class SyncLanguageServer:
         include_imports: bool = True, include_self: bool = False,
         include_body: bool = False,
         include_file_symbols: bool = False,
-    ) -> List[multilspy_types.UnifiedSymbolInformation]:
+    ) -> List[ReferenceInSymbol]:
         """
         Finds all symbols that reference the symbol at the given location.
         This is similar to request_references but filters to only include symbols
@@ -1959,7 +1936,7 @@ class SyncLanguageServer:
         :param include_body: whether to include the body of the symbols in the result.
         :param include_file_symbols: whether to include references that are file symbols. This
             is often a fallback mechanism for when the reference cannot be resolved to a symbol.
-        :return: List of symbols that reference the target symbol.
+        :return: List of objects containing the symbol and the location of the reference.
         """
         assert self.loop
         result = asyncio.run_coroutine_threadsafe(
@@ -2115,6 +2092,7 @@ class SyncLanguageServer:
 
         If the language server is not running, this method will log a warning and do nothing.
         """
+        self.save_cache()
         if not self.is_running():
             self.language_server.logger.log("Language server not running, skipping shutdown.", logging.INFO)
             return
@@ -2125,7 +2103,6 @@ class SyncLanguageServer:
         self.loop_thread.join()
         self.loop = None
         self.loop_thread = None
-        self.save_cache()
 
     def save_cache(self):
         """

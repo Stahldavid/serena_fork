@@ -1,7 +1,7 @@
 import logging
 import os
 from enum import Enum
-from typing import Any, ClassVar, Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 import yaml
 from sensai.util.string import ToStringMixin
@@ -16,11 +16,11 @@ class PromptTemplate(ToStringMixin, ParameterizedTemplateInterface):
         self.name = name
         self._jinja_template = JinjaTemplate(jinja_template_string.strip())
 
-    def _tostring_excludes(self) -> list[str]:
-        return ["jinja_template"]
+    def _tostring_exclude_private(self) -> bool:
+        return True
 
-    def render(self, **kwargs: Any) -> str:
-        return self._jinja_template.render(**kwargs)
+    def render(self, **params: Any) -> str:
+        return self._jinja_template.render(**params)
 
     def get_parameters(self) -> list[str]:
         return self._jinja_template.get_parameters()
@@ -123,8 +123,6 @@ class _MultiLangContainer(Generic[T], ToStringMixin):
 
 
 class MultiLangPromptTemplate(ParameterizedTemplateInterface):
-    _FORBIDDEN_PARAM_NAMES: ClassVar[set[str]] = {"lang_code", "fallback_mode"}  # avoid collisions with **kwargs in calls to render
-
     """
     Represents a prompt template with support for multiple languages.
     The parameters of all prompt templates (for all languages) are (must be) the same.
@@ -153,11 +151,6 @@ class MultiLangPromptTemplate(ParameterizedTemplateInterface):
         :param allow_overwrite: whether to allow overwriting an existing entry for the same language
         """
         incoming_parameters = prompt_template.get_parameters()
-        if contained_fobidden_parameters := self._FORBIDDEN_PARAM_NAMES.intersection(incoming_parameters):
-            raise ValueError(
-                f"Cannot add prompt template for language '{lang_code}' to MultiLangPromptTemplate '{self.name}'"
-                f"since it contains forbidden parameter names: {contained_fobidden_parameters}"
-            )
         if len(self) > 0:
             parameters = self.get_parameters()
             if parameters != incoming_parameters:
@@ -182,17 +175,20 @@ class MultiLangPromptTemplate(ParameterizedTemplateInterface):
         return first_prompt_template.get_parameters()
 
     def render(
-        self, lang_code: str = DEFAULT_LANG_CODE, fallback_mode: LanguageFallbackMode = LanguageFallbackMode.EXCEPTION, **kwargs: Any
+        self,
+        params: dict[str, Any],
+        lang_code: str = DEFAULT_LANG_CODE,
+        fallback_mode: LanguageFallbackMode = LanguageFallbackMode.EXCEPTION,
     ) -> str:
         prompt_template = self.get_prompt_template(lang_code, fallback_mode)
-        return prompt_template.render(**kwargs)
+        return prompt_template.render(**params)
 
 
 class MultiLangPromptList(_MultiLangContainer[PromptList]):
     pass
 
 
-class PromptCollection:
+class MultiLangPromptCollection:
     """
     Main class for managing a collection of prompt templates and prompt lists, with support for multiple languages.
     All data will be read from the yamls directly contained in the given directory on initialization.
@@ -313,79 +309,8 @@ class PromptCollection:
     def render_prompt_template(
         self,
         prompt_name: str,
+        params: dict[str, Any],
         lang_code: str = DEFAULT_LANG_CODE,
-        **kwargs: Any,
     ) -> str:
         """Renders the prompt template for the given prompt name and language code."""
-        return self.get_prompt_template(prompt_name, lang_code=lang_code).render(**kwargs)
-
-
-class PromptFactoryBase:
-    """A base class for auto-generated prompt factory classes."""
-
-    def __init__(self, prompts_dir: str, lang_code: str = DEFAULT_LANG_CODE, fallback_mode=LanguageFallbackMode.EXCEPTION):
-        """
-        :param prompts_dir: the directory containing the prompt templates and prompt lists
-        :param lang_code: the language code to use for retrieving the prompt templates and prompt lists.
-            Leave as `default` for single-language use cases.
-        :param fallback_mode: the fallback mode to use when a prompt template or prompt list is not found for the requested language.
-            Irrelevant for single-language use cases.
-        """
-        self.lang_code = lang_code
-        self._prompt_collection = PromptCollection(prompts_dir, fallback_mode=fallback_mode)
-
-    def _render_prompt(self, prompt_name: str, **kwargs) -> str:
-        return self._prompt_collection.render_prompt_template(prompt_name, self.lang_code, **kwargs)
-
-    def _get_prompt_list(self, prompt_name: str) -> PromptList:
-        return self._prompt_collection.get_prompt_list(prompt_name, self.lang_code)
-
-
-def autogenerate_prompt_factory_module(prompts_dir: str, target_module_path: str) -> None:
-    """
-    Autogenerates a prompt factory module for the given prompt collection directory.
-    The generated `PromptFactory` class is meant to be the central entry class for retrieving and rendering prompt templates and prompt lists
-    in your application. It will contain one method per prompt template and prompt list, and is useful for both single- and multi-language use cases.
-
-    :param prompts_dir: the directory containing the prompt templates and prompt lists
-    :param target_module_path: the path to the target module file. Important: The module will be overwritten!
-    """
-    generated_code = """
-# ruff: noqa
-# black: skip
-# mypy: ignore-errors
-
-# NOTE: This module is auto-generated from interprompt.autogenerate_prompt_factory_module, do not edit manually!
-
-from interprompt.promt_template import PromptFactoryBase, PromptList
-from typing import Any
-
-class PromptFactory(PromptFactoryBase):
-    \"""
-    A class for retrieving and rendering prompt templates and prompt lists.
-    \"""
-"""
-    # ---- add methods based on prompt template names and parameters and prompt list names ----
-    prompt_collection = PromptCollection(prompts_dir)
-
-    for template_name in prompt_collection.get_prompt_template_names():
-        template_parameters = prompt_collection.get_prompt_template_parameters(template_name)
-        render_call_str = f'"{template_name}"'
-        if len(template_parameters) == 0:
-            method_params_str = ""
-        else:
-            method_params_str = ", *, " + ", ".join([f"{param}: Any" for param in template_parameters])
-            render_call_str += ", " + ", ".join([f"{param}={param}" for param in template_parameters])
-        generated_code += f"""
-    def create_{template_name}(self{method_params_str}) -> str:
-        return self._render_prompt({render_call_str})
-"""
-    for prompt_list_name in prompt_collection.get_prompt_list_names():
-        generated_code += f"""
-    def get_list_{prompt_list_name}(self) -> PromptList:
-        return self._get_prompt_list('{prompt_list_name}')
-"""
-    os.makedirs(os.path.dirname(target_module_path), exist_ok=True)
-    with open(target_module_path, "w", encoding="utf-8") as f:
-        f.write(generated_code)
-    log.info(f"Prompt factory generated successfully in {target_module_path}")
+        return self.get_prompt_template(prompt_name, lang_code=lang_code).render(**params)

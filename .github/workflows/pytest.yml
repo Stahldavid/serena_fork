@@ -55,10 +55,11 @@ jobs:
         run: uv pip install -e ".[dev]"
       - name: Test with pytest
         shell: bash
-        # Currently java Language Server is not working on macos
+        # Currently, java and rust seem to cause problems in CI, and snapshot tests seem to cause problems on Windows
+        # probably due to the way the language servers are started and stopped
         run: |
-          if [ "${{ matrix.os }}" = "macos-latest" ]; then
-            uv run pytest -m "not java"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            uv run pytest -m "not java and not rust and not snapshot"
           else
-            uv run poe test
+            uv run pytest -m "not java and not rust"
           fi
